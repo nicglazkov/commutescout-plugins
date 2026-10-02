@@ -108,7 +108,8 @@ def test_city_lists_become_camera_records():
                         "ACTIVE_STATUS": "Inactive", "CAMERA_LATITUDE": 38.9,
                         "CAMERA_LONGITUDE": -77.0}},
     ])
-    assert [c["ref"] for c in dc] == ["dc:ATE 0846"] and dc[0]["mph"] == 25
+    # A source's own key can hold characters an alert id cannot.
+    assert [c["ref"] for c in dc] == ["dc:ATE-0846"] and dc[0]["mph"] == 25
     # San Francisco's dataset is one row per camera per day; a camera is kept once.
     sf = refresh.from_sf([{"site_id": "MTAF024", "location": "WB 1333 BAY ST", "posted_speed": "25",
                            "latitude": "37.8036", "longitude": "-122.4290"}] * 3)
@@ -207,6 +208,11 @@ def test_the_shipped_file_is_what_the_server_expects():
     sources = {c["by"] for c in data["cameras"]}
     assert {"OpenStreetMap", "City of Chicago", "District of Columbia",
             "City and County of San Francisco"} <= sources
+    server = load("server")
     for cam in data["cameras"]:
+        # Every shipped record makes a valid alert: checked on all of them,
+        # because one city's keys can break a rule the others never touch.
+        errs = flare.validate_alert(server.alert(cam, server._hour()))
+        assert errs == [], (cam, errs)
         assert cam["kind"] in ("CAMERA_SPEED", "CAMERA_RED_LIGHT")
         assert 18 <= cam["lat"] <= 71.5 and -168 <= cam["lon"] <= -66.5, cam
