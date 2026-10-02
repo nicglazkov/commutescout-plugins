@@ -1,19 +1,37 @@
-# Speed and red light cameras (OpenStreetMap)
+# Speed and red light cameras
 
-A read-only [Flare](https://github.com/nicglazkov/commutescout/blob/main/docs/flare.md) plugin that serves fixed speed
-and red light cameras in the United States, as mapped by OpenStreetMap
-contributors.
+A read-only [Flare](https://github.com/nicglazkov/commutescout/blob/main/docs/flare.md)
+plugin that serves fixed speed and red light cameras in the United
+States, from open data.
 
 - Kinds: `CAMERA_SPEED`, `CAMERA_RED_LIGHT`.
-- Capabilities: `alerts` only. Nothing is reported to it or confirmed
-  through it, and it never asks the apps to speak.
-- Coverage is whatever has been mapped: good in some cities, thin in
-  others. A wrong or missing camera is fixed on openstreetmap.org; every
-  alert links to its record there.
+- Capabilities: `alerts` and `snapshot`. Nothing is reported to it or
+  confirmed through it, and it never asks the apps to speak.
+- The data is the same for everyone, so CommuteScout lists it as
+  **shared**: cameras show across the map at any zoom, not only around
+  the person looking.
+
+## Where the cameras come from
+
+| Source | Covers | Cameras |
+|---|---|---|
+| OpenStreetMap | Nationwide, wherever volunteers have mapped | about 1,470 |
+| City of Chicago open data | Chicago, complete | about 510 |
+| District of Columbia open data | Washington DC, complete | about 280 |
+| San Francisco open data | San Francisco speed cameras, complete | about 55 |
+
+A city's list is complete for that city; elsewhere coverage is whatever
+has been mapped, which is good in some places and thin in others. A
+camera that appears in both a city list and OpenStreetMap is counted
+once. Every alert says which source it came from and links to it.
+
+Adding a city is a function in `refresh.py` that turns its dataset into
+records, and a line in `fetch_all`. A wrong or missing OpenStreetMap
+camera is fixed on openstreetmap.org.
 
 ## How it works
 
-`refresh.py` runs one Overpass query and writes `cameras.json`. The
+`refresh.py` reads every source once and writes `cameras.json`. The
 service loads that file at start and answers from memory, so it has no
 upstream to wait on and starts in about a second.
 
@@ -36,5 +54,6 @@ It scales to zero, so it costs nothing while nobody asks.
 
 ## Data
 
-(c) OpenStreetMap contributors, under the Open Database License. See
-https://www.openstreetmap.org/copyright.
+OpenStreetMap data is (c) OpenStreetMap contributors, under the Open
+Database License: https://www.openstreetmap.org/copyright. The city
+datasets are public records published by each city.
