@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install -r requirements-dev.txt pip-audit
+      - name: Lint
+        run: ruff check .
+      - name: Test
+        run: python -m pytest -q
+      - name: Audit what each plugin deploys with
+        # Each plugin ships from its own pinned requirements.txt. When an
+        # advisory lands, bump the pin there.
+        run: |
+          pip-audit -r waze-relay/requirements.txt
+          pip-audit -r osm-cameras/requirements.txt

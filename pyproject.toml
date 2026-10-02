@@ -1,0 +1,14 @@
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+# Each plugin is a deployable service of its own, not a package. The
+# relay's modules are importable here so its tests can reach them; the
+# camera plugin's tests load its files by path.
+pythonpath = ["waze-relay"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]

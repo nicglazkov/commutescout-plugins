@@ -1,0 +1,9 @@
+# What the tests need, on top of each plugin's own requirements.txt.
+-r waze-relay/requirements.txt
+-r osm-cameras/requirements.txt
+pytest>=8
+pytest-asyncio>=0.24
+ruff>=0.6
+# The Flare conformance check (ca_roads.flare) and the backend's side of
+# the contract the relay's tests pin (ca_roads_demo.flare_sources).
+ca-roads-mcp @ git+https://github.com/nicglazkov/commutescout@main
