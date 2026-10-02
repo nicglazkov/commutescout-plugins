@@ -11,20 +11,23 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        plugin: [waze-relay, osm-cameras]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+      # Each plugin installs with its own pins, the ones it deploys with,
+      # so one plugin's versions never have to agree with another's.
       - name: Install
-        run: pip install -r requirements-dev.txt pip-audit
+        run: pip install -r ${{ matrix.plugin }}/requirements.txt -r requirements-dev.txt pip-audit
       - name: Lint
-        run: ruff check .
+        run: ruff check ${{ matrix.plugin }} tests/${{ matrix.plugin }}
       - name: Test
-        run: python -m pytest -q
-      - name: Audit what each plugin deploys with
-        # Each plugin ships from its own pinned requirements.txt. When an
-        # advisory lands, bump the pin there.
-        run: |
-          pip-audit -r waze-relay/requirements.txt
-          pip-audit -r osm-cameras/requirements.txt
+        run: python -m pytest -q tests/${{ matrix.plugin }}
+      - name: Audit what the plugin deploys with
+        # When an advisory lands, bump the pin in the plugin's requirements.txt.
+        run: pip-audit -r ${{ matrix.plugin }}/requirements.txt

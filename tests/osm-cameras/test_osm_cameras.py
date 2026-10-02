@@ -10,7 +10,7 @@ import httpx
 import pytest
 from ca_roads import flare
 
-HERE = Path(__file__).resolve().parent.parent / "osm-cameras"
+HERE = Path(__file__).resolve().parents[2] / "osm-cameras"
 
 OVERPASS = {
     "osm3s": {"timestamp_osm_base": "2026-10-01T00:00:00Z"},

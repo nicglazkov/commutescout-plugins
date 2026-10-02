@@ -32,10 +32,13 @@ how to get listed.
 
 ```
 python -m venv .venv
-.venv/bin/pip install -r requirements-dev.txt     # Windows: .venv\Scripts\pip
+.venv/bin/pip install -r waze-relay/requirements.txt -r requirements-dev.txt
 .venv/bin/python -m pytest
 .venv/bin/python -m ruff check .
 ```
+
+On Windows the tools are under `.venv\Scripts`. CI installs and tests
+each plugin on its own, with the pins that plugin deploys with.
 
 The tests run every plugin through the Flare conformance check, which
 lives in the CommuteScout repository; `requirements-dev.txt` installs it

@@ -283,7 +283,7 @@ def test_the_image_carries_every_module_the_service_imports():
     ModuleNotFoundError. Keep the glob, and this stays impossible."""
     from pathlib import Path
 
-    relay_dir = Path(__file__).resolve().parents[1] / "waze-relay"
+    relay_dir = Path(__file__).resolve().parents[2] / "waze-relay"
     dockerfile = (relay_dir / "Dockerfile").read_text(encoding="utf-8")
     copies = [line for line in dockerfile.splitlines()
               if line.startswith("COPY") and ".py" in line]
