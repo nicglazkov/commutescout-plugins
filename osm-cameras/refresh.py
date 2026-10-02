@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import sys
 import urllib.parse
 import urllib.request
@@ -94,6 +95,9 @@ def record(ref: str, kind: str, lat, lon, *, mph=None, where: str | None = None,
         return None
     if not (18.0 <= lat <= 71.5 and -168.0 <= lon <= -66.5):
         return None
+    # An alert id may hold letters, digits and _ . : @ - only; a source's
+    # own key ("ATE 0012") often holds more.
+    ref = re.sub(r"[^A-Za-z0-9_.:@-]+", "-", ref).strip("-")[:100]
     rec = {"ref": ref, "kind": kind, "lat": lat, "lon": lon, "by": by}
     limit = limit_mph(mph)
     if limit and kind == SPEED:
