@@ -1,5 +1,6 @@
-"""osm-cameras: the OpenStreetMap response becomes the right
-records, and the service is a conforming, read-only Flare plugin."""
+"""osm-cameras: OpenStreetMap and the city lists become the right
+records, the two are merged without counting a camera twice, and the
+service is a conforming, read-only Flare plugin with a snapshot."""
 
 import importlib.util
 import json
@@ -41,7 +42,7 @@ OVERPASS = {
 }
 
 
-def load(name: str, **env):
+def load(name: str):
     spec = importlib.util.spec_from_file_location(f"osm_cameras_{name}", HERE / f"{name}.py")
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
@@ -50,41 +51,91 @@ def load(name: str, **env):
 
 
 @pytest.fixture
-def server(tmp_path, monkeypatch):
+def cameras():
     refresh = load("refresh")
+    city = refresh.from_sf([{"site_id": "MTAF024", "location": "WB 1333 BAY ST",
+                             "posted_speed": "25", "latitude": "37.8036",
+                             "longitude": "-122.4290"}])
+    return refresh.merge(city, refresh.from_overpass(OVERPASS))
+
+
+@pytest.fixture
+def server(tmp_path, monkeypatch, cameras):
     data = tmp_path / "cameras.json"
-    data.write_text(json.dumps({"as_of": "2026-10-01T00:00:00Z",
-                                "cameras": refresh.cameras(OVERPASS)}), encoding="utf-8")
+    data.write_text(json.dumps({"as_of": "2026-10-01T00:00:00Z", "cameras": cameras}),
+                    encoding="utf-8")
     monkeypatch.setenv("CAMERAS_FILE", str(data))
     return load("server")
 
 
 def test_overpass_elements_become_camera_records():
-    found = {c["id"]: c for c in load("refresh").cameras(OVERPASS)}
-    assert sorted(found) == [1, 2, 3, 4, 5]
-    assert found[1] == {"id": 1, "kind": "CAMERA_SPEED", "lat": 38.9001, "lon": -77.0301, "mph": 25}
-    assert found[2]["kind"] == "CAMERA_RED_LIGHT" and "mph" not in found[2]
-    assert found[3]["kind"] == "CAMERA_SPEED" and "mph" not in found[3]   # "signals" is no limit
-    assert found[4]["kind"] == "CAMERA_RED_LIGHT"                         # the relation decides
-    assert found[5] == {"id": 5, "kind": "CAMERA_SPEED", "lat": 40.0, "lon": -105.0, "mph": 45}
+    found = {c["ref"]: c for c in load("refresh").from_overpass(OVERPASS)}
+    assert sorted(found) == ["n1", "n2", "n3", "n4", "n5"]
+    assert found["n1"] == {"ref": "n1", "kind": "CAMERA_SPEED", "lat": 38.9001, "lon": -77.0301,
+                           "by": "OpenStreetMap", "mph": 25,
+                           "url": "https://www.openstreetmap.org/node/1"}
+    assert found["n2"]["kind"] == "CAMERA_RED_LIGHT" and "mph" not in found["n2"]
+    assert found["n3"]["kind"] == "CAMERA_SPEED" and "mph" not in found["n3"]   # "signals"
+    assert found["n4"]["kind"] == "CAMERA_RED_LIGHT"   # the relation decides
+    assert found["n5"]["mph"] == 45
 
 
 def test_limits_are_read_as_miles_per_hour_or_not_at_all():
     limit = load("refresh").limit_mph
     assert limit("35 mph") == 35 and limit("35") == 35 and limit(" 55MPH ") == 55
+    assert limit(25.0) == 25
     assert limit("signals") is None and limit("50 km/h") is None and limit(None) is None
     assert limit("300") is None
 
 
-def test_a_refresh_that_lost_most_cameras_is_refused(tmp_path, monkeypatch, capsys):
+def test_city_lists_become_camera_records():
+    refresh = load("refresh")
+    chi = refresh.from_chicago([{"intersection": "744 W Fullerton Ave", "first_approach": "WB",
+                                 "latitude": "41.9255", "longitude": "-87.6483"}],
+                               "CAMERA_RED_LIGHT")
+    assert chi[0]["kind"] == "CAMERA_RED_LIGHT" and chi[0]["by"] == "City of Chicago"
+    assert chi[0]["where"] == "744 W Fullerton Ave (WB)" and chi[0]["ref"].startswith("chi:rl:")
+    dc = refresh.from_dc([
+        {"attributes": {"ENFORCEMENT_SPACE_CODE": "ATE 0846", "ENFORCEMENT_TYPE": "Speed",
+                        "LOCATION_DESCRIPTION": "700 BLK ALLEN Y LEW PL NW E/B",
+                        "SPEED_LIMIT": 25.0, "ACTIVE_STATUS": "Active",
+                        "CAMERA_LATITUDE": 38.9029, "CAMERA_LONGITUDE": -77.02341}},
+        # A stop sign camera is another kind, and a retired camera is gone.
+        {"attributes": {"ENFORCEMENT_SPACE_CODE": "ATE 1", "ENFORCEMENT_TYPE": "Stop Sign",
+                        "ACTIVE_STATUS": "Active", "CAMERA_LATITUDE": 38.9,
+                        "CAMERA_LONGITUDE": -77.0}},
+        {"attributes": {"ENFORCEMENT_SPACE_CODE": "ATE 2", "ENFORCEMENT_TYPE": "Speed",
+                        "ACTIVE_STATUS": "Inactive", "CAMERA_LATITUDE": 38.9,
+                        "CAMERA_LONGITUDE": -77.0}},
+    ])
+    assert [c["ref"] for c in dc] == ["dc:ATE 0846"] and dc[0]["mph"] == 25
+    # San Francisco's dataset is one row per camera per day; a camera is kept once.
+    sf = refresh.from_sf([{"site_id": "MTAF024", "location": "WB 1333 BAY ST", "posted_speed": "25",
+                           "latitude": "37.8036", "longitude": "-122.4290"}] * 3)
+    assert len(sf) == 1 and sf[0]["mph"] == 25
+    # A row with no usable position, or one outside the country, is dropped.
+    assert refresh.record("x", "CAMERA_SPEED", None, "-87.6", by="x") is None
+    assert refresh.record("x", "CAMERA_SPEED", "51.5", "-0.1", by="x") is None
+
+
+def test_a_camera_in_both_a_city_list_and_openstreetmap_is_counted_once():
+    refresh = load("refresh")
+    city = [refresh.record("dc:1", "CAMERA_SPEED", 38.90012, -77.03012, mph=25, by="DC")]
+    merged = refresh.merge(city, refresh.from_overpass(OVERPASS))
+    refs = [c["ref"] for c in merged]
+    assert "dc:1" in refs and "n1" not in refs       # the same camera: the city's record wins
+    assert "n2" in refs                              # a red light camera a few meters away is not
+    assert "n5" in refs
+
+
+def test_a_refresh_that_lost_most_cameras_is_refused(tmp_path, monkeypatch):
     refresh = load("refresh")
     out = tmp_path / "cameras.json"
-    out.write_text(json.dumps({"as_of": "x", "cameras": [{"id": i} for i in range(100)]}),
+    out.write_text(json.dumps({"as_of": "x", "cameras": [{"ref": str(i)} for i in range(100)]}),
                    encoding="utf-8")
-    saved = tmp_path / "overpass.json"
-    saved.write_text(json.dumps(OVERPASS), encoding="utf-8")
     monkeypatch.setattr(refresh, "OUT", out)
-    assert refresh.main([str(saved)]) == 1
+    monkeypatch.setattr(refresh, "fetch_all", lambda saved=None: ([{"ref": "a"}], "now", {"x": 1}))
+    assert refresh.main([]) == 1
     assert len(json.loads(out.read_text(encoding="utf-8"))["cameras"]) == 100
 
 
@@ -94,16 +145,17 @@ async def test_the_plugin_passes_the_conformance_check(server):
     async with httpx.AsyncClient(transport=transport, base_url="https://plugin.example") as c:
         rep = await flare.check_plugin("https://plugin.example", client=c)
     assert rep.success, rep.text()
+    assert any(p.startswith("snapshot:") for p in rep.passed)
 
 
 @pytest.mark.asyncio
-async def test_alerts_are_valid_nearest_first_and_link_to_their_record(server):
+async def test_alerts_are_valid_nearest_first_and_say_where_they_come_from(server):
     transport = httpx.ASGITransport(app=server.app)
     async with httpx.AsyncClient(transport=transport, base_url="https://plugin.example") as c:
         hs = (await c.get("/flare/v1/handshake")).json()
         assert flare.validate_handshake(hs) == []
         assert hs["capabilities"] == {"alerts": True, "report": False, "confirm": False,
-                                      "notify": False}
+                                      "notify": False, "snapshot": True}
         body = (await c.get("/flare/v1/alerts",
                             params={"lat": 38.9, "lon": -77.03, "r": 2000})).json()
         got = body["alerts"]
@@ -112,14 +164,26 @@ async def test_alerts_are_valid_nearest_first_and_link_to_their_record(server):
             assert flare.validate_alert(a) == [], a
             assert a["notify"] is False
         assert got[0]["description"] == "Speed camera, limit 25 mph."
-        assert got[0]["extra"] == {"limit_mph": 25}
+        assert got[0]["extra"] == {"data": "OpenStreetMap", "limit_mph": 25}
         assert got[0]["source_url"] == "https://www.openstreetmap.org/node/1"
         assert got[1]["description"] == "Red light camera."
         assert body["as_of"] == "2026-10-01T00:00:00Z"
-        # Denver's camera is not in a search around Washington.
-        far = (await c.get("/flare/v1/alerts",
-                           params={"lat": 40.0, "lon": -105.0, "r": 500})).json()["alerts"]
-        assert [a["id"] for a in far] == ["osm-cameras:n5"]
+        sf = (await c.get("/flare/v1/alerts",
+                          params={"lat": 37.80, "lon": -122.43, "r": 2000})).json()["alerts"]
+        assert sf[0]["id"] == "osm-cameras:sf:MTAF024"
+        assert sf[0]["description"] == "Speed camera, limit 25 mph. WB 1333 Bay St."
+        assert sf[0]["extra"]["data"] == "City and County of San Francisco"
+        assert sf[0]["reliability"] > got[0]["reliability"]   # a city's own list is surer
+
+
+@pytest.mark.asyncio
+async def test_the_snapshot_is_every_camera_in_the_same_shape(server, cameras):
+    transport = httpx.ASGITransport(app=server.app)
+    async with httpx.AsyncClient(transport=transport, base_url="https://plugin.example") as c:
+        body = (await c.get("/flare/v1/snapshot")).json()
+    assert len(body["alerts"]) == len(cameras) == 6
+    kept, problems = flare.accept_alerts(body, limit=flare.SNAPSHOT_MAX_ALERTS)
+    assert problems == [] and len(kept) == 6
 
 
 @pytest.mark.asyncio
@@ -137,7 +201,12 @@ async def test_bad_and_out_of_range_requests_are_refused(server):
 
 def test_the_shipped_file_is_what_the_server_expects():
     data = json.loads((HERE / "cameras.json").read_text(encoding="utf-8"))
-    assert data["as_of"] and len(data["cameras"]) > 1000
+    assert data["as_of"] and len(data["cameras"]) > 2000
+    refs = [c["ref"] for c in data["cameras"]]
+    assert len(refs) == len(set(refs))
+    sources = {c["by"] for c in data["cameras"]}
+    assert {"OpenStreetMap", "City of Chicago", "District of Columbia",
+            "City and County of San Francisco"} <= sources
     for cam in data["cameras"]:
         assert cam["kind"] in ("CAMERA_SPEED", "CAMERA_RED_LIGHT")
         assert 18 <= cam["lat"] <= 71.5 and -168 <= cam["lon"] <= -66.5, cam

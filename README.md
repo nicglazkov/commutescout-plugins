@@ -12,7 +12,7 @@ Browse them, installed or not, in the
 
 | Plugin | What it shows | Data |
 |---|---|---|
-| [osm-cameras](osm-cameras/) | Fixed speed and red light cameras in the United States | OpenStreetMap |
+| [osm-cameras](osm-cameras/) | Fixed speed and red light cameras in the United States | OpenStreetMap and city open data |
 | [waze-relay](waze-relay/) | Crowd reports: police, crashes, hazards, jams | Unofficial relay of Waze reports |
 
 ## Write your own

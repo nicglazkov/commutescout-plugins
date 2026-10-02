@@ -1,11 +1,17 @@
-"""Speed and red light cameras from OpenStreetMap, as a Flare plugin.
+"""Speed and red light cameras from open data, as a Flare plugin.
 
 Fixed cameras do not come and go like a police report, so there is no
 upstream to poll: the plugin serves a small file (cameras.json, rebuilt
-by refresh.py) and answers the two read endpoints of docs/flare.md.
-Nothing is reported to it and nothing is confirmed through it; a camera
-that is wrong is fixed where the data lives, on openstreetmap.org, and
-every alert links to its record there.
+by refresh.py from OpenStreetMap and from cities that publish their own
+camera lists) and answers the read endpoints of the Flare
+specification. Nothing is reported to it and nothing is confirmed
+through it; a camera that is wrong is fixed where the data lives, and
+every alert links there.
+
+The data is the same for everyone: no alert here exists because some
+person was somewhere. So besides ``alerts`` near a point, the plugin
+offers ``snapshot``, the whole list in one response, which lets a map
+show cameras at any zoom without asking about every place in turn.
 
 Run it:
 
@@ -32,23 +38,25 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 ID = "osm-cameras"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 PLUGIN = {
     "protocol": "flare/1",
     "id": ID,
-    "name": "Speed and red light cameras (OpenStreetMap)",
+    "name": "Speed and red light cameras",
     "version": VERSION,
-    "description": ("Fixed speed and red light cameras mapped by OpenStreetMap contributors. "
-                    "Coverage is whatever has been mapped: good in some cities, thin in others."),
-    "capabilities": {"alerts": True, "report": False, "confirm": False, "notify": False},
+    "description": ("Fixed speed and red light cameras from OpenStreetMap and from cities that "
+                    "publish their own lists (Chicago, Washington DC, San Francisco). Complete "
+                    "in those cities; elsewhere, whatever has been mapped."),
+    "capabilities": {"alerts": True, "report": False, "confirm": False, "notify": False,
+                     "snapshot": True},
     "kinds": ["CAMERA_RED_LIGHT", "CAMERA_SPEED"],
     # [south, west, north, east]: the fifty states.
     "coverage": {"bbox": [18.0, -168.0, 71.5, -66.5]},
     # The file changes monthly; an hour keeps a caller's copy inside the
     # day-long ttl with room to spare.
     "refresh_s": 3600,
-    "attribution": {"name": "OpenStreetMap contributors",
-                    "url": "https://www.openstreetmap.org/copyright"},
+    "attribution": {"name": "OpenStreetMap contributors and city open data",
+                    "url": "https://github.com/nicglazkov/commutescout-plugins/tree/main/osm-cameras"},
     "contact": os.environ.get("FLARE_CONTACT", "mailto:hello@commutescout.com"),
     "auth": "none",
 }
@@ -78,9 +86,10 @@ class Cameras:
     def __init__(self, path: Path) -> None:
         data = json.loads(path.read_text(encoding="utf-8"))
         self.as_of: str = data.get("as_of") or datetime.now(UTC).isoformat()
-        self.count = len(data["cameras"])
+        self.all: list[dict] = data["cameras"]
+        self.count = len(self.all)
         self.buckets: dict[tuple[int, int], list[dict]] = {}
-        for cam in data["cameras"]:
+        for cam in self.all:
             key = (math.floor(cam["lat"]), math.floor(cam["lon"]))
             self.buckets.setdefault(key, []).append(cam)
 
@@ -93,31 +102,38 @@ class Cameras:
                 for cam in self.buckets.get((by, bx), ()):
                     d = meters(lat, lon, cam["lat"], cam["lon"])
                     if d <= r:
-                        hits.append((d, cam["id"], cam))
+                        hits.append((d, cam["ref"], cam))
         hits.sort(key=lambda h: h[:2])
         return [cam for _, _, cam in hits[:MAX_ALERTS]]
 
 
 def alert(cam: dict, report_ts: str) -> dict:
     """One camera as a Flare alert record."""
-    label = LABEL[cam["kind"]]
+    text = LABEL[cam["kind"]]
+    if cam.get("mph"):
+        text += f", limit {cam['mph']} mph"
+    text += "."
+    if cam.get("where"):
+        text += f" {cam['where']}."
     out = {
-        "id": f"{ID}:n{cam['id']}",
+        "id": f"{ID}:{cam['ref']}",
         "kind": cam["kind"],
         "lat": cam["lat"],
         "lon": cam["lon"],
-        "description": f"{label}, limit {cam['mph']} mph." if cam.get("mph") else f"{label}.",
+        "description": text[:200],
         # A fixed camera has no report time of its own. The start of the
         # current hour keeps the record inside its day-long ttl on every
         # poll without the timestamp changing on each one.
         "report_ts": report_ts,
         "ttl_s": TTL_S,
-        "reliability": 0.7,
+        "reliability": 0.9 if cam.get("by") != "OpenStreetMap" else 0.7,
         "notify": False,
-        "source_url": f"https://www.openstreetmap.org/node/{cam['id']}",
+        "extra": {"data": cam.get("by") or "OpenStreetMap"},
     }
+    if cam.get("url"):
+        out["source_url"] = cam["url"]
     if cam.get("mph"):
-        out["extra"] = {"limit_mph": cam["mph"]}
+        out["extra"]["limit_mph"] = cam["mph"]
     return out
 
 
@@ -139,6 +155,10 @@ def _limited(request: Request) -> bool:
     return False
 
 
+def _hour() -> str:
+    return datetime.now(UTC).replace(minute=0, second=0, microsecond=0).isoformat()
+
+
 async def handshake(_: Request) -> JSONResponse:
     return JSONResponse(PLUGIN, headers={"Cache-Control": "public, max-age=3600"})
 
@@ -157,9 +177,19 @@ async def alerts(request: Request) -> JSONResponse:
     s, w, n, e = PLUGIN["coverage"]["bbox"]
     if not (s - 1 <= lat <= n + 1 and w - 1 <= lon <= e + 1):
         return error(422, "outside_coverage", "That point is outside this plugin's coverage.")
-    hour = datetime.now(UTC).replace(minute=0, second=0, microsecond=0).isoformat()
+    hour = _hour()
     return JSONResponse({"alerts": [alert(c, hour) for c in store.near(lat, lon, r)],
                          "ttl_s": PLUGIN["refresh_s"], "as_of": store.as_of})
+
+
+async def snapshot(request: Request) -> JSONResponse:
+    """Every camera, in one response: the same records ``alerts`` returns."""
+    if _limited(request):
+        return error(429, "rate_limited", "Slow down.", f"{RATE_PER_MIN} requests a minute.")
+    hour = _hour()
+    return JSONResponse({"alerts": [alert(c, hour) for c in store.all],
+                         "ttl_s": PLUGIN["refresh_s"], "as_of": store.as_of},
+                        headers={"Cache-Control": "public, max-age=600"})
 
 
 async def status(_: Request) -> JSONResponse:
@@ -170,6 +200,7 @@ async def status(_: Request) -> JSONResponse:
 app = Starlette(routes=[
     Route("/flare/v1/handshake", handshake),
     Route("/flare/v1/alerts", alerts),
+    Route("/flare/v1/snapshot", snapshot),
     Route("/status", status),
 ])
 
