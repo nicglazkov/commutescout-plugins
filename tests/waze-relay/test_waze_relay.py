@@ -160,6 +160,45 @@ def test_an_alert_past_its_ttl_is_not_served():
     assert crash.records()
 
 
+def test_an_alert_past_its_ttl_leaves_the_cache_too():
+    # The session never sends an alert twice, so once it is over there is
+    # no reason to keep filtering it out of every answer.
+    store = _store(_alert("old", pub_s=NOW - 1201), _alert("live"))
+    assert [r["id"] for r in store.records()] == ["wz:live"]
+    assert len(store.source.cache) == 1
+    # A soft-deleted or voted-away alert is not the same as an expired one.
+    hidden = _store(_alert())
+    for address in ("203.0.113.1", "203.0.113.2", "203.0.113.3"):
+        hidden.votes.add("wz:abc-123", "gone", _voter("x", address))
+    assert hidden.records() == [] and len(hidden.source.cache) == 1
+
+
+def test_six_thousand_alerts_answer_in_a_few_milliseconds():
+    # The confirmation tracker used to purge its whole map once per alert,
+    # which was quadratic: 624 ms at this size. One purge per answer.
+    alerts = [_alert(f"u{i}", lat=LA[0] + (i % 80) * 0.002, lon=LA[1] + (i // 80) * 0.002)
+              for i in range(6000)]
+    store = _store(*alerts)
+    store.records()                         # the first pass seeds the tracker
+    t0 = time.perf_counter()
+    for _ in range(3):
+        assert len(store.near(*LA, 50_000)) == store_module.MAX_ALERTS
+    per_answer = (time.perf_counter() - t0) / 3
+    assert per_answer < 0.1, f"{per_answer * 1000:.0f} ms per answer"
+    assert len(store.confirmations) == 6000
+
+
+def test_stale_sightings_are_purged_once_per_pass():
+    wall = [NOW]
+    store = _store(_alert(), wall=lambda: wall[0])
+    store.records()
+    assert len(store.confirmations) == 1
+    wall[0] += 3601
+    store.source.cache.clear()              # the alert is gone upstream
+    store.records()
+    assert len(store.confirmations) == 0
+
+
 def test_nothing_is_served_once_the_data_stops_being_refreshed():
     clock = [1000.0]
     store = _store(_alert(), clock=lambda: clock[0])

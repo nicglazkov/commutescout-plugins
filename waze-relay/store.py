@@ -267,16 +267,46 @@ class Store:
         return datetime.fromtimestamp(self._wall() - age, UTC).isoformat()
 
     def records(self) -> list[dict]:
-        """Every cached alert as a Flare record, expired ones dropped."""
+        """Every cached alert as a Flare record, expired ones dropped.
+
+        An alert past its life leaves the cache here as well as the answer.
+        The session never sends an alert twice, so nothing brings it back,
+        and the cache stays the size of what is live rather than of
+        everything the session has ever sent.
+        """
         if not self.fresh:
             return []
         now = self._wall()
+        self.confirmations.purge()
         out = []
+        over = []
         for alert in self.source.snapshot():
             record = self.to_record(alert, now)
             if record is not None:
                 out.append(record)
+            elif self.expired(alert, now):
+                over.append(alert.uuid)
+        if over:
+            self.source.cache.drop(over)
         return out
+
+    def expired(self, alert, now: float) -> bool:
+        """Whether an alert is past its life: its kind's TTL counted from
+        the report or the last confirmation, whichever is later."""
+        kind = mapping.flare_kind(alert.type, alert.subtype)
+        if kind is None or not alert.uuid:
+            return False
+        return self._life_end(alert, kind) < now
+
+    def _life_end(self, alert, kind: str) -> float:
+        alert_id = f"wz:{alert.uuid}"
+        thumbs = alert.n_thumbs_up or 0
+        report_ts = alert.pub_millis / 1000.0
+        confirm_ts = self.confirmations.confirm_ts(alert.uuid, thumbs)
+        voted_at = self.votes.confirmed_at(alert_id)
+        if voted_at is not None:
+            confirm_ts = max(confirm_ts or 0.0, voted_at)
+        return (confirm_ts or report_ts) + mapping.ttl_for(kind)
 
     def near(self, lat: float, lon: float, radius_m: float) -> list[dict]:
         """The records within ``radius_m`` of a point, nearest first."""

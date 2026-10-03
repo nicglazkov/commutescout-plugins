@@ -81,6 +81,14 @@ class AlertCache:
             self._soft_deleted.pop(uuid_, None)
         return [a for u, a in self._alerts.items() if u not in self._soft_deleted]
 
+    def drop(self, uuids: list[str]) -> None:
+        """Forget alerts the relay has decided are over. The session will
+        not send them again, which is the point: an alert past its life is
+        not kept around to be filtered out on every answer."""
+        for uuid_ in uuids:
+            self._alerts.pop(uuid_, None)
+            self._soft_deleted.pop(uuid_, None)
+
     def clear(self) -> None:
         self._alerts.clear()
         self._soft_deleted.clear()
@@ -102,6 +110,11 @@ class ConfirmTracker:
     The RT feed carries no confirmation timestamp, so it is inferred as the
     moment the thumbs-up count was last seen to increase. Entries expire an
     hour after they were last touched, so the map self-trims.
+
+    The trim runs on ``purge``, which the caller invokes once per pass over
+    the cache. It used to run inside ``confirm_ts``, once per alert, which
+    made every answer quadratic in the cache size: at six thousand alerts
+    an answer took over half a second of CPU.
     """
 
     def __init__(self, now: Callable[[], float] | None = None) -> None:
@@ -112,7 +125,6 @@ class ConfirmTracker:
         """Record this sighting and return the confirmation time in epoch
         seconds, or None when the count has never been seen to rise."""
         now = self._now()
-        self._purge(now)
         thumbs = n_thumbs_up or 0
         seen = self._seen.get(alert_id)
         if seen is None:
@@ -124,6 +136,11 @@ class ConfirmTracker:
             seen.thumbs = thumbs
         return seen.confirm_s
 
-    def _purge(self, now: float) -> None:
+    def purge(self) -> None:
+        """Drop the sightings that have gone an hour untouched."""
+        now = self._now()
         for alert_id in [k for k, v in self._seen.items() if v.expiry <= now]:
             self._seen.pop(alert_id, None)
+
+    def __len__(self) -> int:
+        return len(self._seen)
