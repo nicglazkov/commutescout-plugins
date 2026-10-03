@@ -112,15 +112,33 @@ from four points with boxes 70 km wide and held 43 alerts for the whole
 Los Angeles basin on a weekday afternoon. At city zoom the upstream sends
 everything it has for the tile.
 
+Whatever radius an ask names, only the tiles within 20 km of its point
+join the rotation, about twenty tiles; the answer still covers the whole
+radius asked for, from what is cached. The CommuteScout backend asks 50 km
+around each person, which would be a hundred tiles each, and four of those
+would fill the cap and stretch a lap past ten minutes.
+
 The tiles take turns, stalest first, and no tile is fetched more often
-than once per refresh window. Ten people in ten places is roughly ninety
-tiles, a lap of under a minute at the session's pace. The wanted set is
-capped at `WAZE_MAX_TILES`; past that, the tiles nobody has asked about for
-longest drop out, so a flood of asks degrades to slower laps rather than to
-nothing. `/status` reports `stalest_s`, how long ago the most neglected
-wanted tile was fetched, which is the lap time measured rather than
-estimated. When it climbs past the refresh window for good, run an
-instance per region.
+than once per refresh window. Ten people in ten places is roughly two
+hundred tiles, a lap of under two minutes at the session's pace. The wanted
+set is capped at `WAZE_MAX_TILES`; past that, the tiles nobody has asked
+about for longest drop out, so a flood of asks degrades to slower laps
+rather than to nothing. `/status` reports `stalest_s`, how long ago the
+most neglected wanted tile was fetched, which is the lap time measured
+rather than estimated. When it climbs past the refresh window for good, run
+an instance per region.
+
+An answer's `as_of` is the oldest fetch among the tiles it was answered
+from, not the newest fetch anywhere in the service, so a caller can tell a
+neighbourhood that has not been fetched yet from one that was fetched a
+moment ago.
+
+An alert stays fresh for its kind's TTL counted from the latest of its
+report, its last confirmation, and the last fetch of its tile that still
+showed it. The upstream sends an alert once and says when it clears, so an
+alert still there after its tile was fetched again is live by the
+upstream's own account, however old the report. A tile nobody asks about
+is not fetched, so its alerts age out on the TTL.
 
 If no refresh has succeeded for the refresh window plus five minutes, the
 plugin serves nothing at all. Stale police and crash alerts presented as

@@ -287,6 +287,72 @@ def test_an_ask_covers_every_tile_its_disc_touches_and_no_more():
     assert (345, -1183) not in tiles
 
 
+def test_a_wide_ask_is_fetched_twenty_kilometres_around_and_answered_in_full():
+    store = _store(_alert("near", lat=LA[0] + 0.05, lon=LA[1]),
+                   _alert("far", lat=LA[0] + 0.4, lon=LA[1]))
+    store.want(*LA, 50_000)
+    tiles = store.wanted_tiles()
+    assert 12 <= len(tiles) <= 24, len(tiles)
+    for tile in tiles:
+        lat, lon = store_module.tile_center(tile)
+        assert store_module.meters(*LA, lat, lon) < 20_000 + 8_000
+    # The answer is not clipped to what is fetched.
+    assert [r["id"] for r in store.near(*LA, 50_000)] == ["wz:near", "wz:far"]
+
+
+async def test_as_of_is_the_oldest_tile_the_answer_came_from():
+    clock = [1000.0]
+    polled = []
+
+    async def fake_refresh(lat, lon, radius_m):
+        polled.append((lat, lon))
+        store.source.last_ok = clock[0]
+        return 0
+
+    store = _store(_alert(), clock=lambda: clock[0])
+    store.source.refresh = fake_refresh
+    # Nothing fetched for this disc yet: the service-wide stamp is all there is.
+    assert store.as_of_for(*LA, 5_000) == store.as_of
+    store.want(*LA, 5_000)
+    assert await store.poll_once()
+    first = len(polled)
+    clock[0] += 30
+    while await store.poll_once():
+        clock[0] += 1
+    assert len(polled) > first
+    # The disc's stamp is its oldest tile; the service's is the newest anywhere.
+    disc = flare.parse_ts(store.as_of_for(*LA, 5_000)).timestamp()
+    service = flare.parse_ts(store.as_of).timestamp()
+    assert disc < service
+    assert disc == pytest.approx(NOW - (clock[0] - 1000.0), abs=1)
+    # A point nowhere near the fetched tiles still gets the service-wide stamp.
+    assert store.as_of_for(40.7, -74.0, 5_000) == store.as_of
+
+
+async def test_an_alert_the_upstream_still_shows_outlives_its_report_ttl():
+    clock = [1000.0]
+    wall = [NOW]
+
+    async def fake_refresh(lat, lon, radius_m):
+        return 1
+
+    old = _alert(pub_s=NOW - 1100)             # a police report, 1200 s TTL
+    store = _store(old, clock=lambda: clock[0], wall=lambda: wall[0])
+    store.source.refresh = fake_refresh
+    store.want(*LA)
+    assert await store.poll_once()             # the tile is fetched; the alert is still there
+    clock[0] += 200
+    wall[0] += 200                             # 1300 s after the report
+    store.source.last_ok = clock[0]
+    assert [r["id"] for r in store.records()] == ["wz:abc-123"]
+    # Nobody asks again, so the tile is not fetched again, and it ages out.
+    clock[0] += 1300
+    wall[0] += 1300
+    store.source.last_ok = clock[0]
+    assert store.records() == []
+    assert len(store.source.cache) == 0
+
+
 def test_the_query_box_still_covers_a_tile_after_the_client_shrinks_it():
     from waze.source import PRIMARY_VIEWPORT
     half_diagonal = math.hypot(0.05 * 110574, 0.05 * 91000)
