@@ -45,7 +45,14 @@ log = logging.getLogger("waze_relay.store")
 
 TILE_DEG = 0.1                # a city-zoom tile, about 11 km on a side
 CELL_RADIUS_M = 80_000        # the radius a caller gets when it names none
-MAX_TILES = 400               # about forty people's neighbourhoods at once
+# How far around an ask is fetched, whatever radius the ask names. A caller
+# is answered for the whole radius it asks from what is cached, but only
+# the tiles within this of the point join the rotation: a 50 km ask is a
+# hundred tiles, and four of those fill the cap and stretch a lap past ten
+# minutes against a one-minute refresh. Twenty kilometres is about twenty
+# tiles, the neighbourhood a person is actually driving through.
+FETCH_RADIUS_M = 20_000
+MAX_TILES = 400               # about twenty people's neighbourhoods at once
 WANTED_TTL_S = 600.0          # a tile is fetched only if it was asked about this recently
 STALE_GRACE_S = 300.0         # serve on after a failure for this long, then serve nothing
 GONE_VOTES_TO_HIDE = 3
@@ -209,6 +216,8 @@ class Store:
         # tile -> how far its centre is from the point of its latest ask,
         # so a fresh disc fills from the person outward.
         self._ask_m: dict[tuple[int, int], float] = {}
+        # uuid -> wall time of the last tile fetch that still showed it.
+        self._seen_at: dict[str, float] = {}
         self._lock = asyncio.Lock()
 
     # -------------------------------------------------------------- asks
@@ -217,7 +226,7 @@ class Store:
         """Remember that someone asked about a disc. Every tile it touches
         joins the rotation, and asking again is what keeps it there."""
         now = self._now()
-        for tile in tiles_for_disc(lat, lon, radius_m, self.tile_deg):
+        for tile in tiles_for_disc(lat, lon, min(radius_m, FETCH_RADIUS_M), self.tile_deg):
             self._asks[tile] = now
             c_lat, c_lon = tile_center(tile, self.tile_deg)
             self._ask_m[tile] = math.hypot((c_lat - lat) * M_PER_DEG_LAT,
@@ -266,6 +275,19 @@ class Store:
             0.0, self._now() - self.source.last_ok)
         return datetime.fromtimestamp(self._wall() - age, UTC).isoformat()
 
+    def as_of_for(self, lat: float, lon: float, radius_m: float) -> str:
+        """How old an answer for this disc is: the oldest fetch among the
+        tiles it is fetched from. The service-wide stamp is the newest
+        tile anywhere, which says nothing about this neighbourhood; when
+        none of its tiles has been fetched yet that stamp is all there is.
+        """
+        tiles = tiles_for_disc(lat, lon, min(radius_m, FETCH_RADIUS_M), self.tile_deg)
+        fetched = [self._tile_ok[t] for t in tiles if t in self._tile_ok]
+        if not fetched:
+            return self.as_of
+        age = max(0.0, self._now() - min(fetched))
+        return datetime.fromtimestamp(self._wall() - age, UTC).isoformat()
+
     def records(self) -> list[dict]:
         """Every cached alert as a Flare record, expired ones dropped.
 
@@ -280,7 +302,9 @@ class Store:
         self.confirmations.purge()
         out = []
         over = []
+        live = set()
         for alert in self.source.snapshot():
+            live.add(alert.uuid)
             record = self.to_record(alert, now)
             if record is not None:
                 out.append(record)
@@ -288,6 +312,8 @@ class Store:
                 over.append(alert.uuid)
         if over:
             self.source.cache.drop(over)
+        if len(self._seen_at) > len(live):
+            self._seen_at = {u: t for u, t in self._seen_at.items() if u in live}
         return out
 
     def expired(self, alert, now: float) -> bool:
@@ -299,6 +325,18 @@ class Store:
         return self._life_end(alert, kind) < now
 
     def _life_end(self, alert, kind: str) -> float:
+        """When an alert goes stale: its kind's TTL counted from the latest
+        of the report, the last confirmation, and the last fetch of its
+        tile that still showed it.
+
+        The upstream sends an alert once and says when it clears, so an
+        alert still there after its tile was fetched again is live by the
+        upstream's own account, however old the report. Counting from the
+        report alone dropped police alerts at twenty minutes while Waze was
+        still showing them, and a jam, at five minutes, almost never
+        reached an answer at all. A tile nobody asks about is not fetched,
+        so its alerts still age out on the TTL.
+        """
         alert_id = f"wz:{alert.uuid}"
         thumbs = alert.n_thumbs_up or 0
         report_ts = alert.pub_millis / 1000.0
@@ -306,7 +344,8 @@ class Store:
         voted_at = self.votes.confirmed_at(alert_id)
         if voted_at is not None:
             confirm_ts = max(confirm_ts or 0.0, voted_at)
-        return (confirm_ts or report_ts) + mapping.ttl_for(kind)
+        seen_at = self._seen_at.get(alert.uuid, 0.0)
+        return max(confirm_ts or report_ts, seen_at) + mapping.ttl_for(kind)
 
     def near(self, lat: float, lon: float, radius_m: float) -> list[dict]:
         """The records within ``radius_m`` of a point, nearest first."""
@@ -341,7 +380,7 @@ class Store:
         if voted_at is not None:
             confirm_ts = max(confirm_ts or 0.0, voted_at)
         ttl_s = mapping.ttl_for(kind)
-        if (confirm_ts or report_ts) + ttl_s < now:
+        if max(confirm_ts or report_ts, self._seen_at.get(alert.uuid, 0.0)) + ttl_s < now:
             return None
         record = {
             "id": alert_id,
@@ -391,6 +430,7 @@ class Store:
             try:
                 count = await self.source.refresh(lat, lon, tile_query_radius_m(lat, self.tile_deg))
                 self._tile_ok[tile] = self._now()
+                self._note_seen(tile)
                 log.info("tile %d,%d (%.2f,%.2f) refreshed: %d new, %d cached, %d tiles wanted",
                          tile[0], tile[1], lat, lon, count - before, count, len(self._asks))
             except Exception as exc:  # noqa: BLE001 - one bad tile never stops the rest
@@ -398,6 +438,13 @@ class Store:
                 log.warning("tile %d,%d (%.2f,%.2f) failed: %s: %s",
                             tile[0], tile[1], lat, lon, type(exc).__name__, exc)
         return True
+
+    def _note_seen(self, tile: tuple[int, int]) -> None:
+        """Every alert inside a tile just fetched is live as of now."""
+        wall = self._wall()
+        for alert in self.source.snapshot():
+            if tile_of(alert.lat, alert.lon, self.tile_deg) == tile:
+                self._seen_at[alert.uuid] = wall
 
     async def run(self) -> None:
         """The background loop, started with the service."""

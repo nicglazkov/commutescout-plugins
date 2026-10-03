@@ -240,7 +240,7 @@ async def alerts(request: Request) -> JSONResponse:
     if _steers(request):
         store.want(lat, lon, radius)
     return JSONResponse({"alerts": store.near(lat, lon, radius),
-                         "ttl_s": REFRESH_S, "as_of": store.as_of})
+                         "ttl_s": REFRESH_S, "as_of": store.as_of_for(lat, lon, radius)})
 
 
 def _point(request: Request) -> tuple[float, float, float]:
@@ -298,7 +298,7 @@ async def my_alerts(request: Request) -> JSONResponse:
         # because the relay is busy.
         store.want(lat, lon, radius)
         return JSONResponse({"alerts": store.near(lat, lon, radius), "ttl_s": USER_POLL_S,
-                             "as_of": store.as_of, "session": "shared"})
+                             "as_of": store.as_of_for(lat, lon, radius), "session": "shared"})
     session.trigger_refresh_if_stale(lat, lon, radius)
     return JSONResponse({"alerts": session.alerts(lat, lon, radius, store.to_record),
                          "ttl_s": USER_POLL_S, "as_of": session.as_of, "session": "user"})
