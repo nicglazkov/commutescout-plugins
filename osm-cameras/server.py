@@ -25,6 +25,8 @@ Check it:
 
 from __future__ import annotations
 
+import hmac
+import ipaddress
 import json
 import math
 import os
@@ -64,6 +66,12 @@ MAX_ALERTS = 500
 MAX_RADIUS_M = 100_000
 TTL_S = 86_400
 RATE_PER_MIN = 120
+# A bearer a trusted caller may present to be exempt from the per-address
+# limit. The CommuteScout backend polls the snapshot for everyone, so a
+# stranger sharing its address must not be able to 429 it into an hour of
+# backoff. Put the same value in the catalog manifest's "token" field; the
+# backend sends that as a bearer header. Unset means nobody is exempt.
+TRUSTED_TOKEN = os.environ.get("FLARE_TRUSTED_TOKEN") or None
 LABEL = {"CAMERA_SPEED": "Speed camera", "CAMERA_RED_LIGHT": "Red light camera"}
 
 
@@ -141,8 +149,47 @@ store = Cameras(Path(os.environ.get("CAMERAS_FILE") or Path(__file__).with_name(
 _buckets: dict[str, list[float]] = {}
 
 
+def client_key(forwarded_for: str | None, peer: str | None) -> str:
+    """The address a limit is counted against.
+
+    On Cloud Run every request reaches the app from the same front-end
+    address, so the peer address is one bucket for the whole world and one
+    scraper's 429s land on everyone. Cloud Run appends the address it
+    actually saw to X-Forwarded-For, so the last entry is the one to use;
+    an earlier entry is whatever the caller wrote. An IPv6 client is folded
+    to its /64, the allocation a home gets, so rotating the low bits does
+    not mint buckets. The same two rules as the relay's clientip.py, kept
+    here because each plugin ships on its own.
+    """
+    ip = peer or "unknown"
+    if forwarded_for:
+        entries = [e.strip() for e in forwarded_for.split(",") if e.strip()]
+        if entries:
+            ip = entries[-1]
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip
+    if addr.version == 6:
+        mapped = addr.ipv4_mapped
+        if mapped is not None:
+            return str(mapped)
+        return str(ipaddress.ip_network(f"{addr}/64", strict=False))
+    return ip
+
+
+def _trusted(request: Request) -> bool:
+    if not TRUSTED_TOKEN:
+        return False
+    return hmac.compare_digest((request.headers.get("authorization") or "").encode("utf-8"),
+                               f"Bearer {TRUSTED_TOKEN}".encode())
+
+
 def _limited(request: Request) -> bool:
-    ip = request.client.host if request.client else "?"
+    if _trusted(request):
+        return False
+    ip = client_key(request.headers.get("x-forwarded-for"),
+                    request.client.host if request.client else None)
     now = time.monotonic()
     if len(_buckets) > 10_000:
         _buckets.clear()
