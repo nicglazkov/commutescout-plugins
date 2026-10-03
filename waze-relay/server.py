@@ -19,6 +19,7 @@ import asyncio
 import contextlib
 import hmac
 import logging
+import math
 import os
 import time
 from collections.abc import AsyncIterator
@@ -56,6 +57,9 @@ RATE_PER_MIN = int(os.environ.get("WAZE_RATE_PER_MIN") or 600)
 CONFIRM_PER_MIN = int(os.environ.get("WAZE_CONFIRM_PER_MIN") or 60)
 MAX_BUCKETS = 50_000
 HTTP_TIMEOUT_S = 30.0
+# /status recomputes the served count, so it is not free; a health check
+# does not need more than this.
+STATUS_PER_MIN = 30
 
 log = logging.getLogger("waze_relay")
 
@@ -182,7 +186,26 @@ def _prune_buckets(now: float) -> None:
             _buckets.pop(key, None)
 
 
+def _steers(request: Request) -> bool:
+    """Whether this caller's asks decide which tiles get fetched.
+
+    Demand is the one lever a stranger has over what the relay spends and
+    whom it serves: every tile an ask touches joins the rotation, and past
+    the cap the tiles asked about longest ago drop out, so a stranger
+    polling a wide disc once a minute can evict the backend's tiles. So
+    only a caller presenting a token steers; anyone else is answered from
+    whatever is cached. When no token is configured at all there is nobody
+    to tell apart, and every ask steers, as before.
+    """
+    return _trusted(request) or not (TOKEN or CONFIRM_TOKEN)
+
+
 def _limited(request: Request, per_minute: int = 0) -> bool:
+    # The per-address bucket is for strangers. A mediated backend asks per
+    # grid cell for everyone it serves, and its worst minute is exactly the
+    # ceiling, so it was getting partial 429s recorded as cell failures.
+    if not per_minute and _trusted(request):
+        return False
     now = time.monotonic()
     _prune_buckets(now)
     who = clientip.key_for(request)
@@ -206,18 +229,39 @@ async def alerts(request: Request) -> JSONResponse:
         return error(429, "rate_limited", "Slow down.",
                      f"{RATE_PER_MIN} requests a minute.")
     try:
-        lat = float(request.query_params["lat"])
-        lon = float(request.query_params["lon"])
-        radius = min(float(request.query_params.get("r", CELL_RADIUS_M)), MAX_RADIUS_M)
+        lat, lon, radius = _point(request)
     except (KeyError, ValueError):
-        return error(400, "bad_request", "lat, lon and r (meters) are required.")
+        return error(400, "bad_request", "lat, lon and r (meters) are required.",
+                     "Finite numbers; r greater than zero.")
     if not store.in_coverage(lat, lon):
         return error(422, "outside_coverage",
                      "That point is outside this plugin's coverage.",
                      "See coverage.bbox in the handshake.")
-    store.want(lat, lon, radius)
+    if _steers(request):
+        store.want(lat, lon, radius)
     return JSONResponse({"alerts": store.near(lat, lon, radius),
                          "ttl_s": REFRESH_S, "as_of": store.as_of})
+
+
+def _point(request: Request) -> tuple[float, float, float]:
+    """lat, lon and a radius in meters from the query, or ValueError. A
+    nan or an infinity parses as a float and then breaks the tile maths,
+    so finiteness is checked here rather than found as a 500."""
+    lat = float(request.query_params["lat"])
+    lon = float(request.query_params["lon"])
+    radius = float(request.query_params.get("r", CELL_RADIUS_M))
+    if not (math.isfinite(lat) and math.isfinite(lon) and math.isfinite(radius) and radius > 0):
+        raise ValueError("not finite")
+    return lat, lon, min(radius, MAX_RADIUS_M)
+
+
+async def _body(request: Request) -> dict | None:
+    """The JSON object a POST carries, or None when it is not one."""
+    try:
+        body = await request.json()
+    except ValueError:
+        return None
+    return body if isinstance(body, dict) else None
 
 
 async def my_alerts(request: Request) -> JSONResponse:
@@ -239,11 +283,11 @@ async def my_alerts(request: Request) -> JSONResponse:
         return error(401, "unauthorized", "A signed-in token is required here.",
                      "Use /flare/v1/alerts for the shared feed.")
     try:
-        lat = sessions_module.snap(float(request.query_params["lat"]))
-        lon = sessions_module.snap(float(request.query_params["lon"]))
-        radius = min(float(request.query_params.get("r", CELL_RADIUS_M)), MAX_RADIUS_M)
+        lat, lon, radius = _point(request)
+        lat, lon = sessions_module.snap(lat), sessions_module.snap(lon)
     except (KeyError, ValueError):
-        return error(400, "bad_request", "lat, lon and r (meters) are required.")
+        return error(400, "bad_request", "lat, lon and r (meters) are required.",
+                     "Finite numbers; r greater than zero.")
     if not store.in_coverage(lat, lon):
         return error(422, "outside_coverage",
                      "That point is outside this plugin's coverage.")
@@ -263,10 +307,9 @@ async def my_alerts(request: Request) -> JSONResponse:
 async def confirm(request: Request) -> JSONResponse:
     if not _authorized(request):
         return error(401, "unauthorized", "This plugin wants a bearer token.")
-    try:
-        body = await request.json()
-    except ValueError:
-        return error(400, "bad_request", "JSON body required.")
+    body = await _body(request)
+    if body is None:
+        return error(400, "bad_request", "A JSON object body is required.")
     if _limited(request, CONFIRM_PER_MIN):
         return error(429, "rate_limited", "Slow down.",
                      f"{CONFIRM_PER_MIN} votes a minute.")
@@ -294,22 +337,24 @@ async def report(request: Request) -> JSONResponse:
         return error(401, "unauthorized", "This plugin wants a bearer token.")
     if _limited(request):
         return error(429, "rate_limited", "Slow down.")
-    try:
-        body = await request.json()
-    except ValueError:
-        return error(400, "bad_request", "JSON body required.")
+    body = await _body(request)
+    if body is None:
+        return error(400, "bad_request", "A JSON object body is required.")
     subtype = mapping.report_subtype(str(body.get("kind") or ""))
     if subtype is None:
         return error(422, "bad_request", "Waze takes no report of that kind.",
                      "See kinds in the handshake.")
     try:
         lat, lon = float(body["lat"]), float(body["lon"])
+        heading = body.get("heading_deg")
+        heading = float(heading) % 360 if heading is not None else 0.0
+        if not (math.isfinite(lat) and math.isfinite(lon) and math.isfinite(heading)):
+            raise ValueError("not finite")
     except (KeyError, TypeError, ValueError):
-        return error(400, "bad_request", "lat and lon are required.")
+        return error(400, "bad_request", "lat and lon are required.",
+                     "Finite numbers; heading_deg, if given, a number too.")
     if not store.in_coverage(lat, lon):
         return error(422, "outside_coverage", "That point is outside this plugin's coverage.")
-    heading = body.get("heading_deg")
-    heading = float(heading) % 360 if heading is not None else 0.0
     member, number = subtype
     try:
         result = await store.source.submit_report(
@@ -323,8 +368,15 @@ async def report(request: Request) -> JSONResponse:
                          "queued": True}, status_code=202)
 
 
-async def status(_: Request) -> JSONResponse:
+async def status(request: Request) -> JSONResponse:
+    if _limited(request, STATUS_PER_MIN):
+        return error(429, "rate_limited", "Slow down.", f"{STATUS_PER_MIN} requests a minute.")
     body = {"id": PLUGIN["id"], "version": VERSION, **store.status()}
+    # The upstream's own words stay in the log. What a stranger gets is the
+    # kind of failure, which says whether the relay is well without saying
+    # what the upstream looks like from here.
+    if body.get("last_error"):
+        body["last_error"] = str(body["last_error"]).split(":", 1)[0]
     if users is not None:
         body["user_sessions"] = users.status()
     return JSONResponse(body)

@@ -145,7 +145,7 @@ phone then reads it directly and nothing goes through CommuteScout.
 | Variable | Default | What it does |
 |---|---|---|
 | `FLARE_TOKEN` | none | Requires `Authorization: Bearer <token>` on every call but the handshake |
-| `FLARE_CONFIRM_TOKEN` | none | Lets the caller holding it be believed about who is voting, without making the listing need a token |
+| `FLARE_CONFIRM_TOKEN` | none | Lets the caller holding it be believed about who is voting, steer which tiles are fetched, and skip the per-address limit, without making the listing need a token |
 | `WAZE_CONFIRM_PER_MIN` | `60` | Votes one address may cast a minute |
 | `FLARE_ID` | `wz-flare` | The plugin id in the handshake |
 | `FLARE_NAME` | Unofficial Waze relay (community) | The name shown in the sources list |
@@ -157,7 +157,7 @@ phone then reads it directly and nothing goes through CommuteScout.
 | `WAZE_MAX_TILES` | `400` | The most tiles kept in the rotation at once |
 | `WAZE_SHRINK_STEPS` | `1` | Query boxes per tile; one is enough at city zoom |
 | `WAZE_QUERY_BUDGET_S` | `10` | Wall-clock budget for one square's box series |
-| `WAZE_RATE_PER_MIN` | `600` | Requests one address may make a minute. A mediated caller asks per grid cell, so this has to fit a few hundred |
+| `WAZE_RATE_PER_MIN` | `600` | Requests one address without a token may make a minute. A caller holding a token is not counted |
 | `WAZE_USER_SESSIONS` | off | Let a signed-in phone hold a session of its own. See below |
 | `WAZE_USER_SESSIONS_MAX` | `5` | How many of those may exist at once. The rest fall back to the shared feed |
 | `WAZE_USER_IDLE_S` | `600` | How long a user session survives without a request |
@@ -325,6 +325,17 @@ nobody is trusted and the mediated backend counts as one voter, which means
 alerts are effectively never hidden through the map. That is the safe
 default, and restoring the feature is a deliberate act rather than something
 that happens by accident.
+
+The token decides two more things. Only a caller holding one steers the
+fetcher: every tile an ask touches joins the rotation, and past the cap the
+tiles asked about longest ago drop out, so a stranger polling a wide disc
+once a minute could otherwise evict the backend's tiles. A stranger is
+answered from whatever is cached. And a caller holding one is not counted
+against `WAZE_RATE_PER_MIN`, whose worst case for a mediated backend was
+exactly the ceiling. When neither token is configured there is nobody to
+tell apart, and every ask steers. So when you set a token, make sure the
+manifest carries the same value, or `/status` will show `tiles_wanted` at
+zero and the map goes quiet.
 
 **Reports** are off by default, so `capabilities.report` is `false` and
 `/flare/v1/report` answers 404. The client underneath does support
