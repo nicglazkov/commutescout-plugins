@@ -296,11 +296,102 @@ def test_the_image_carries_every_module_the_service_imports():
     assert "clientip.py" in modules and "server.py" in modules
 
 
+# ------------------------------------------------- steering the fetcher
+
+
+async def _read(client, address, *, token=None, r=25_000):
+    headers = {"x-forwarded-for": f"10.0.0.1, {address}"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return await client.get("/flare/v1/alerts", headers=headers,
+                            params={"lat": LA[0], "lon": LA[1], "r": r})
+
+
+async def test_a_stranger_is_answered_but_does_not_steer_the_fetcher(monkeypatch):
+    monkeypatch.setattr(relay, "CONFIRM_TOKEN", "backend-secret")
+    store = _store()
+    async with _client(store) as client:
+        assert (await _read(client, "203.0.113.7")).status_code == 200
+        assert store.wanted_tiles() == []
+        assert (await _read(client, "203.0.113.7", token="backend-secret")).status_code == 200
+        assert len(store.wanted_tiles()) > 0
+
+
+async def test_with_no_token_configured_every_ask_steers(monkeypatch):
+    monkeypatch.setattr(relay, "TOKEN", None)
+    monkeypatch.setattr(relay, "CONFIRM_TOKEN", None)
+    store = _store()
+    async with _client(store) as client:
+        assert (await _read(client, "203.0.113.7")).status_code == 200
+    assert len(store.wanted_tiles()) > 0
+
+
+async def test_the_backend_is_not_in_the_strangers_bucket(monkeypatch):
+    monkeypatch.setattr(relay, "RATE_PER_MIN", 2)
+    monkeypatch.setattr(relay, "CONFIRM_TOKEN", "backend-secret")
+    store = _store()
+    async with _client(store) as client:
+        codes = [(await _read(client, "203.0.113.7", token="backend-secret")).status_code
+                 for _ in range(5)]
+        assert codes == [200] * 5
+        assert (await _read(client, "203.0.113.7")).status_code == 200
+        assert (await _read(client, "203.0.113.7")).status_code == 200
+        assert (await _read(client, "203.0.113.7")).status_code == 429
+        # Votes keep their own, tighter allowance for everyone.
+        monkeypatch.setattr(relay, "CONFIRM_PER_MIN", 1)
+        assert (await _vote(client, address="203.0.113.8", reporter="a",
+                            vote="up", token="backend-secret")).status_code == 200
+        assert (await _vote(client, address="203.0.113.8", reporter="b",
+                            vote="up", token="backend-secret")).status_code == 429
+
+
+# ------------------------------------------------- what a request may say
+
+
+async def test_a_nan_radius_or_point_is_a_400_not_a_500():
+    store = _store()
+    async with _client(store) as client:
+        for r in ("nan", "inf", "0", "-5", "x"):
+            assert (await _read(client, "203.0.113.7", r=r)).status_code == 400, r
+        bad = await client.get("/flare/v1/alerts", params={"lat": "nan", "lon": LA[1]})
+        assert bad.status_code == 400
+
+
+async def test_a_body_that_is_not_an_object_is_a_400_not_a_500():
+    store = _store()
+    async with _client(store) as client:
+        for body in ("[]", "42", "\"x\"", "null"):
+            rep = await client.post("/flare/v1/confirm", content=body,
+                                    headers={"content-type": "application/json"})
+            assert rep.status_code == 400, body
+
+
+async def test_a_bad_heading_in_a_report_is_a_400(monkeypatch):
+    monkeypatch.setattr(relay, "REPORTS", True)
+    store = _store()
+    async with _client(store) as client:
+        for heading in ("north", "nan", [1]):
+            rep = await client.post("/flare/v1/report", json={
+                "kind": "POLICE_VISIBLE", "lat": LA[0], "lon": LA[1], "heading_deg": heading})
+            assert rep.status_code == 400, heading
+
+
+async def test_status_is_limited_and_keeps_the_upstreams_words_to_itself():
+    store = _store()
+    store.source.note_failure(RuntimeError("waze said: your account 12345 is banned"))
+    async with _client(store) as client:
+        body = (await client.get("/status")).json()
+        assert body["last_error"] == "RuntimeError"
+        codes = [(await client.get("/status")).status_code
+                 for _ in range(relay.STATUS_PER_MIN + 2)]
+    assert 429 in codes
+
+
 @pytest.fixture(autouse=True)
 def _restore_module_state():
     before = (relay.store, relay.TOKEN, relay.CONFIRM_TOKEN,
-              relay.RATE_PER_MIN, relay.CONFIRM_PER_MIN)
+              relay.RATE_PER_MIN, relay.CONFIRM_PER_MIN, relay.REPORTS)
     yield
     (relay.store, relay.TOKEN, relay.CONFIRM_TOKEN,
-     relay.RATE_PER_MIN, relay.CONFIRM_PER_MIN) = before
+     relay.RATE_PER_MIN, relay.CONFIRM_PER_MIN, relay.REPORTS) = before
     relay._buckets.clear()
