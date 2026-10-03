@@ -52,6 +52,13 @@ gcloud run deploy osm-cameras --source osm-cameras \
 
 It scales to zero, so it costs nothing while nobody asks.
 
+The per-address limit (120 requests a minute) is keyed on the last
+`X-Forwarded-For` entry, the address Cloud Run itself appends, with IPv6
+folded to its /64. Set `FLARE_TRUSTED_TOKEN` to a secret and put the same
+value in the catalog manifest's `token` field, and the backend's polls
+are exempt from that limit: a scraper sharing its address cannot 429 the
+snapshot poll everyone's map depends on.
+
 ## Data
 
 OpenStreetMap data is (c) OpenStreetMap contributors, under the Open

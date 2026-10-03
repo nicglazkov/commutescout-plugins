@@ -200,6 +200,38 @@ async def test_bad_and_out_of_range_requests_are_refused(server):
         assert (await c.post("/flare/v1/report", json={})).status_code in (404, 405)
 
 
+def test_the_limit_is_keyed_on_the_real_client_not_the_proxy(server):
+    # Cloud Run appends the address it saw to X-Forwarded-For and every
+    # request arrives from the same front-end peer.
+    key = server.client_key
+    assert key("198.51.100.4, 203.0.113.9", "169.254.1.1") == "203.0.113.9"
+    assert key(None, "169.254.1.1") == "169.254.1.1"
+    assert key("2001:db8:1:2:3:4:5:6", None) == "2001:db8:1:2::/64"
+    assert key("::ffff:203.0.113.9", None) == "203.0.113.9"
+    assert key("not an address", None) == "not an address"
+
+
+@pytest.mark.asyncio
+async def test_one_scrapers_limit_does_not_land_on_the_backend(server, monkeypatch):
+    monkeypatch.setattr(server, "TRUSTED_TOKEN", "backend-secret")
+    transport = httpx.ASGITransport(app=server.app, client=("169.254.1.1", 1))
+    async with httpx.AsyncClient(transport=transport, base_url="https://plugin.example") as c:
+        for _ in range(server.RATE_PER_MIN):
+            assert (await c.get("/flare/v1/snapshot",
+                                headers={"X-Forwarded-For": "203.0.113.9"})).status_code == 200
+        assert (await c.get("/flare/v1/snapshot",
+                            headers={"X-Forwarded-For": "203.0.113.9"})).status_code == 429
+        # Another address behind the same proxy is another bucket.
+        assert (await c.get("/flare/v1/snapshot",
+                            headers={"X-Forwarded-For": "203.0.113.10"})).status_code == 200
+        # The backend's token is exempt however busy its address is.
+        trusted = {"X-Forwarded-For": "203.0.113.9", "Authorization": "Bearer backend-secret"}
+        for _ in range(server.RATE_PER_MIN + 5):
+            assert (await c.get("/flare/v1/snapshot", headers=trusted)).status_code == 200
+        wrong = {"X-Forwarded-For": "203.0.113.9", "Authorization": "Bearer wrong"}
+        assert (await c.get("/flare/v1/snapshot", headers=wrong)).status_code == 429
+
+
 def test_the_shipped_file_is_what_the_server_expects():
     data = json.loads((HERE / "cameras.json").read_text(encoding="utf-8"))
     assert data["as_of"] and len(data["cameras"]) > 2000
