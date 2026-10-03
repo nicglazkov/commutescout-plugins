@@ -187,16 +187,40 @@ phone then reads it directly and nothing goes through CommuteScout.
 | `PORT` | `8300` | The port to listen on |
 
 `WAZE_STATE_FILE` needs somewhere that survives a restart to be worth
-setting. On Cloud Run the filesystem does not, so leave it unset there.
+setting. On Cloud Run the container filesystem does not, but a Cloud
+Storage bucket mounted as a volume does; see below.
 
 ### Deploying
 
 ```
+gcloud storage buckets create gs://wz-flare-state --project ca-roads-mcp \
+  --location us-west1 --uniform-bucket-level-access
+
 gcloud run deploy wz-flare --source waze-relay \
   --project ca-roads-mcp --region us-west1 \
-  --memory 512Mi --cpu 1 --min-instances 0 --max-instances 1 \
-  --concurrency 40 --allow-unauthenticated
+  --memory 512Mi --cpu 1 --min-instances 1 --max-instances 1 \
+  --no-cpu-throttling --concurrency 40 --allow-unauthenticated \
+  --add-volume name=state,type=cloud-storage,bucket=wz-flare-state \
+  --add-volume-mount volume=state,mount-path=/state \
+  --update-env-vars WAZE_STATE_FILE=/state/waze.json
 ```
+
+Three of those settings are not the Cloud Run defaults, and each one
+matters:
+
+- `--min-instances 1` and `--no-cpu-throttling`. The fetch loop runs
+  between requests, not inside them. With the defaults the instance gets
+  CPU only while a request is in flight and is shut down when none has
+  come for a while, so the loop is starved to whatever slivers the
+  backend's polls happen to leave it, the tiles go stale, and every cold
+  start begins from an empty cache. An always-on instance with CPU
+  allocated costs a few dollars a month and the loop runs at its own
+  pace.
+- `WAZE_STATE_FILE` on a mounted bucket. The anonymous account lives in
+  the process; without the file every cold start registers a new one,
+  outside the day's minting budget, which is the likeliest way for the
+  egress range to end up blocked. The service account needs
+  `roles/storage.objectUser` on the bucket.
 
 Keep `--max-instances 1`: the session, the account and the cache are all in
 process, and a second instance means a second anonymous account.
