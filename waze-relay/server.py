@@ -434,7 +434,10 @@ def main() -> None:  # pragma: no cover
 
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
                         format="%(levelname)s %(name)s %(message)s")
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8300")))  # noqa: S104
+    # No access log: its request lines carry the caller's lat and lon, and
+    # Cloud Run already logs every request.
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8300")),  # noqa: S104
+                access_log=False)
 
 
 if __name__ == "__main__":  # pragma: no cover

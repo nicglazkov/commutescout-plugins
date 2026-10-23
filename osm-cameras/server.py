@@ -255,4 +255,7 @@ app = Starlette(routes=[
 if __name__ == "__main__":  # pragma: no cover
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8310")))  # noqa: S104
+    # No access log: its request lines carry the caller's lat and lon, and
+    # Cloud Run already logs every request.
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8310")),  # noqa: S104
+                access_log=False)
