@@ -37,7 +37,7 @@ from starlette.routing import Route
 from store import CELL_RADIUS_M, Store
 from waze.source import WazeSource
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 # The United States, Alaska and Hawaii included. Coverage is what the plugin
 # will answer for, not what it fetches: it only ever fetches the one-degree
 # cells somebody asked about, so a wide box costs nothing on its own.
@@ -84,6 +84,10 @@ REFRESH_S = int(os.environ.get("WAZE_REFRESH_S") or 60)
 SHRINK_STEPS = int(os.environ.get("WAZE_SHRINK_STEPS") or 1)
 TILE_DEG = float(os.environ.get("WAZE_TILE_DEG") or store_module.TILE_DEG)
 MAX_TILES = int(os.environ.get("WAZE_MAX_TILES") or store_module.MAX_TILES)
+# How long a steering request may spend fetching the tiles it made due
+# before it is answered. This is what lets the relay run on request-based
+# billing: see Store.catch_up. Zero leaves all fetching to the loop.
+CATCH_UP_S = float(os.environ.get("WAZE_CATCH_UP_S") or store_module.CATCH_UP_S)
 QUERY_BUDGET_S = float(os.environ.get("WAZE_QUERY_BUDGET_S") or 10)
 STATE_FILE = os.environ.get("WAZE_STATE_FILE") or None
 # Reporting to Waze is off unless the operator turns it on: the approved plan
@@ -239,6 +243,8 @@ async def alerts(request: Request) -> JSONResponse:
                      "See coverage.bbox in the handshake.")
     if _steers(request):
         store.want(lat, lon, radius)
+        if CATCH_UP_S > 0:
+            await store.catch_up(CATCH_UP_S)
     return JSONResponse({"alerts": store.near(lat, lon, radius),
                          "ttl_s": REFRESH_S, "as_of": store.as_of_for(lat, lon, radius)})
 

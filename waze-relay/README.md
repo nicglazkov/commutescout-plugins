@@ -173,6 +173,7 @@ phone then reads it directly and nothing goes through CommuteScout.
 | `WAZE_TILE_DEG` | `0.1` | Tile size in degrees; smaller is finer and costs more queries |
 | `WAZE_REFRESH_S` | `60` | How often one tile comes round again |
 | `WAZE_MAX_TILES` | `400` | The most tiles kept in the rotation at once |
+| `WAZE_CATCH_UP_S` | `8` | How long a steering request may spend fetching before it answers; `0` leaves all fetching to the loop |
 | `WAZE_SHRINK_STEPS` | `1` | Query boxes per tile; one is enough at city zoom |
 | `WAZE_QUERY_BUDGET_S` | `10` | Wall-clock budget for one square's box series |
 | `WAZE_RATE_PER_MIN` | `600` | Requests one address without a token may make a minute. A caller holding a token is not counted |
@@ -196,31 +197,32 @@ Storage bucket mounted as a volume does; see below.
 gcloud storage buckets create gs://wz-flare-state --project ca-roads-mcp \
   --location us-west1 --uniform-bucket-level-access
 
-gcloud run deploy wz-flare --source waze-relay \
-  --project ca-roads-mcp --region us-west1 \
-  --memory 512Mi --cpu 1 --min-instances 1 --max-instances 1 \
-  --no-cpu-throttling --concurrency 40 --allow-unauthenticated \
-  --add-volume name=state,type=cloud-storage,bucket=wz-flare-state \
-  --add-volume-mount volume=state,mount-path=/state \
-  --update-env-vars WAZE_STATE_FILE=/state/waze.json
+gcloud run deploy wz-flare --source waze-relay   --project ca-roads-mcp --region us-west1   --memory 512Mi --cpu 1 --min-instances 1 --max-instances 1   --cpu-throttling --concurrency 40 --allow-unauthenticated   --add-volume name=state,type=cloud-storage,bucket=wz-flare-state   --add-volume-mount volume=state,mount-path=/state   --update-env-vars WAZE_STATE_FILE=/state/waze.json   --update-secrets FLARE_CONFIRM_TOKEN=wz-flare-confirm-token:latest
 ```
 
-Three of those settings are not the Cloud Run defaults, and each one
+Four of those settings are not the Cloud Run defaults, and each one
 matters:
 
-- `--min-instances 1` and `--no-cpu-throttling`. The fetch loop runs
-  between requests, not inside them. With the defaults the instance gets
-  CPU only while a request is in flight and is shut down when none has
-  come for a while, so the loop is starved to whatever slivers the
-  backend's polls happen to leave it, the tiles go stale, and every cold
-  start begins from an empty cache. An always-on instance with CPU
-  allocated costs a few dollars a month and the loop runs at its own
-  pace.
+- `--cpu-throttling` (request-based billing). The instance gets CPU only
+  while a request is in flight, so the background loop barely runs. A
+  caller that steers demand fetches the tiles its ask made due before it
+  is answered, for up to `WAZE_CATCH_UP_S` (8 seconds by default). Idle
+  time is billed at the idle rate, a few dollars a month, instead of the
+  full CPU rate around the clock. A deployment with many callers can
+  pass `--no-cpu-throttling` instead and let the loop run at its own
+  pace; nothing is due by the time a request arrives, so it answers at
+  once.
+- `--min-instances 1`. The session, the cache and the votes are in
+  process, so an instance that scales to zero starts from an empty cache
+  and the next answer is empty until its tiles are fetched again.
 - `WAZE_STATE_FILE` on a mounted bucket. The anonymous account lives in
   the process; without the file every cold start registers a new one,
   outside the day's minting budget, which is the likeliest way for the
   egress range to end up blocked. The service account needs
   `roles/storage.objectUser` on the bucket.
+- `FLARE_CONFIRM_TOKEN`. Only a caller presenting it steers demand, so
+  only the backend's asks decide what gets fetched. The service account
+  needs `roles/secretmanager.secretAccessor` on the secret.
 
 Keep `--max-instances 1`: the session, the account and the cache are all in
 process, and a second instance means a second anonymous account.
