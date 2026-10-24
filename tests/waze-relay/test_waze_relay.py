@@ -433,6 +433,27 @@ async def test_status_measures_the_lap_rather_than_estimating_it():
     assert st["stalest_s"] == 5 * n
 
 
+async def test_catching_up_fetches_every_due_tile_and_then_stops():
+    clock = [1000.0]
+    polled = []
+
+    async def fake_refresh(lat, lon, radius_m):
+        polled.append((lat, lon))
+        return 0
+
+    store = _store(clock=lambda: clock[0])
+    store.source.refresh = fake_refresh
+    store.want(*LA, 12_000)
+    n = len(store.wanted_tiles())
+    assert await store.catch_up(5.0) == n
+    assert len(polled) == n
+    # Every tile is fresh now: a second ask inside the window fetches nothing.
+    assert await store.catch_up(5.0) == 0
+    # And no budget at all leaves the fetching to the loop.
+    clock[0] += 61
+    assert await store.catch_up(0.0) == 0
+
+
 # -------------------------------------------------------------- endpoints
 
 
@@ -482,6 +503,38 @@ async def test_alerts_answers_inside_the_box_and_refuses_outside_it():
     assert outside.status_code == 422
     assert outside.json()["error"]["code"] == "outside_coverage"
     assert missing.status_code == 400
+
+
+async def test_a_steering_ask_is_answered_with_what_it_made_the_relay_fetch(monkeypatch):
+    # On request-based billing the loop gets no CPU between requests, so
+    # the request that asked has to fetch, or the first answer is empty.
+    async def fake_refresh(lat, lon, radius_m):
+        store.source.cache.submit(AlertQueryResult([_alert("fetched")], []))
+        store.source.last_ok = 1000.0
+        return len(store.source.cache)
+
+    store = _store()
+    store.source.refresh = fake_refresh
+    monkeypatch.setattr(relay, "CATCH_UP_S", 5.0)
+    async with _client(store) as client:
+        response = await client.get("/flare/v1/alerts",
+                                    params={"lat": LA[0], "lon": LA[1], "r": 5_000})
+    assert [a["id"] for a in response.json()["alerts"]] == ["wz:fetched"]
+
+
+async def test_a_caller_that_does_not_steer_fetches_nothing(monkeypatch):
+    async def fake_refresh(lat, lon, radius_m):
+        raise AssertionError("a stranger's ask must not fetch")
+
+    store = _store(_alert())
+    store.source.refresh = fake_refresh
+    monkeypatch.setattr(relay, "CATCH_UP_S", 5.0)
+    monkeypatch.setattr(relay, "CONFIRM_TOKEN", "backend-secret")
+    async with _client(store) as client:
+        response = await client.get("/flare/v1/alerts",
+                                    params={"lat": LA[0], "lon": LA[1], "r": 5_000})
+    assert [a["id"] for a in response.json()["alerts"]] == ["wz:abc-123"]
+    assert store.wanted_tiles() == []
 
 
 async def test_an_oversize_radius_is_clamped_not_refused():

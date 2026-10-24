@@ -58,6 +58,7 @@ STALE_GRACE_S = 300.0         # serve on after a failure for this long, then ser
 GONE_VOTES_TO_HIDE = 3
 VOTE_TTL_S = 2 * 3600.0
 PACE_S = 0.5
+CATCH_UP_S = 8.0              # how long a steering request may spend fetching before its answer
 IDLE_TICK_S = 2.0
 MAX_ALERTS = 500
 ID_OK = re.compile(r"^[A-Za-z0-9_.:@-]{1,128}$")
@@ -413,19 +414,24 @@ class Store:
 
     async def poll_once(self) -> bool:
         """Refresh the stalest wanted tile that is due. True when one was
-        fetched."""
-        tiles = self.wanted_tiles()
-        if not tiles or self.source.backoff_remaining_s() > 0:
-            return False
-        # The stalest tile goes first, and no tile is fetched more often
-        # than once per refresh window. When there are more wanted tiles
-        # than the window fits, the stalest one is always overdue and the
-        # loop simply keeps going round.
-        tile = tiles[0]
-        if self._now() - self._tile_ok.get(tile, 0.0) < self.refresh_s:
-            return False
-        lat, lon = tile_center(tile, self.tile_deg)
+        fetched.
+
+        The tile is chosen under the lock as well as fetched under it: the
+        background loop and any number of requests catching up can all be
+        here at once, and choosing outside it sent two of them after the
+        same tile."""
         async with self._lock:
+            tiles = self.wanted_tiles()
+            if not tiles or self.source.backoff_remaining_s() > 0:
+                return False
+            # The stalest tile goes first, and no tile is fetched more often
+            # than once per refresh window. When there are more wanted tiles
+            # than the window fits, the stalest one is always overdue and the
+            # loop simply keeps going round.
+            tile = tiles[0]
+            if self._now() - self._tile_ok.get(tile, 0.0) < self.refresh_s:
+                return False
+            lat, lon = tile_center(tile, self.tile_deg)
             before = len(self.source.cache)
             try:
                 count = await self.source.refresh(lat, lon, tile_query_radius_m(lat, self.tile_deg))
@@ -445,6 +451,25 @@ class Store:
         for alert in self.source.snapshot():
             if tile_of(alert.lat, alert.lon, self.tile_deg) == tile:
                 self._seen_at[alert.uuid] = wall
+
+    async def catch_up(self, budget_s: float = CATCH_UP_S) -> int:
+        """Fetch the wanted tiles that are due, inside the request that
+        asked, for up to ``budget_s``. Returns how many were fetched.
+
+        On request-based billing an instance has CPU only while a request
+        is in flight, so the background loop barely runs between requests.
+        A caller that steers demand therefore does the fetching its ask
+        made due before it is answered, and the answer comes from the
+        cache that leaves. Where the instance has CPU all the time the
+        loop has already been round, nothing is due, and this returns at
+        once.
+        """
+        deadline = time.monotonic() + budget_s
+        fetched = 0
+        while time.monotonic() < deadline and await self.poll_once():
+            fetched += 1
+            await asyncio.sleep(PACE_S)
+        return fetched
 
     async def run(self) -> None:
         """The background loop, started with the service."""
