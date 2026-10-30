@@ -1,7 +1,7 @@
 # Pinned, like the main image's constraints.txt: a release upstream must not
 # be able to break a deploy with no change on our side.
 anyio==4.15.1
-certifi==2026.10.19
+certifi==2026.10.23
 click==8.5.0
 # Only for checking a signed-in caller's token when WAZE_USER_SESSIONS is on.
 cryptography==50.0.2
@@ -13,5 +13,5 @@ httpcore==1.0.9
 httpx==0.28.1
 idna==3.20
 sniffio==1.3.1
-starlette==1.9.0
+starlette==1.10.0
 uvicorn==0.54.0
